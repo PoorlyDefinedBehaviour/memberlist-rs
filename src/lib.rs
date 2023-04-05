@@ -56,15 +56,6 @@ struct Peer {
     dissemination_count: u32,
 }
 
-impl Peer {
-    fn is_dead(&self) -> bool {
-        match self.status {
-            PeerStatus::Suspected => true,
-            PeerStatus::Alive | PeerStatus::Dead => false,
-        }
-    }
-}
-
 struct OrderByDisseminationCount<'a>(&'a Peer);
 
 impl<'a> PartialEq for OrderByDisseminationCount<'a> {
