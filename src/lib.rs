@@ -139,8 +139,14 @@ pub struct Config {
     pub mailbox_buffer_size: usize,
     /// The amount of time to wait for between failure detection attempts.
     pub failure_detection_attempt_interval: Duration,
-    /// The amount of time a peer has to respond to a ping request.
-    pub peer_ping_request_timeout: Duration,
+    /// The amount of time this peer is willing to wait for failure detection
+    /// to conclude a round of requests.
+    /// Must be greater than `peer_ping_request_timeout_for_indirect_probe` and `peer_ping_req_request_timeout`.
+    pub failure_detection_timeout: Duration,
+    /// The amount of time to wait for a ping response to arrive before starting an indirect probe.
+    pub peer_ping_request_timeout_for_indirect_probe: Duration,
+    /// The amount of time a peer has to respond to a ping req request.
+    pub peer_ping_req_request_timeout: Duration,
     /// Maximum number of peers used to detect if a peer is alive when it doesn't respond to a ping request.
     pub max_number_peers_for_indirect_probe: usize,
     /// Maximum number of peers that can be piggybacked on messages.
@@ -155,7 +161,9 @@ impl Default for Config {
             join_peers: Vec::new(),
             mailbox_buffer_size: 64,
             failure_detection_attempt_interval: Duration::from_secs(4),
-            peer_ping_request_timeout: Duration::from_secs(2),
+            failure_detection_timeout: Duration::from_secs(6),
+            peer_ping_request_timeout_for_indirect_probe: Duration::from_secs(2),
+            peer_ping_req_request_timeout: Duration::from_secs(2),
             max_number_peers_for_indirect_probe: 3,
             max_number_peers_for_dissemination: 3,
             socket_addr: "0.0.0.0:9157".parse().unwrap(),
@@ -203,6 +211,22 @@ impl PeerMessageType {
             PeerMessageType::Ack => 2,
             PeerMessageType::PingReq => 3,
         }
+    }
+}
+
+impl From<u8> for PeerMessageType {
+    fn from(value: u8) -> Self {
+        if value == PeerMessageType::Ping.as_u8() {
+            return PeerMessageType::Ping;
+        }
+        if value == PeerMessageType::Ack.as_u8() {
+            return PeerMessageType::Ack;
+        }
+        if value == PeerMessageType::PingReq.as_u8() {
+            return PeerMessageType::PingReq;
+        }
+
+        unreachable!("unexpected peer message type. value={value}");
     }
 }
 
@@ -393,7 +417,6 @@ impl Memberlist {
 
     #[tracing::instrument(name = "Memberlist::ping_next_peer", skip_all)]
     async fn ping_next_peer(&mut self) {
-        dbg!("aaaaaa ping_next_peer");
         let target_peer_index = match self.next_peer_index() {
             None => {
                 info!("not connected to other peers");
@@ -408,35 +431,44 @@ impl Memberlist {
 
         let piggybacking_peers = self.select_peers_for_dissemination();
 
-        // The number of peers that we have to choose from.
-        // We may not have the number of peers requested in by `max_number_peers_for_indirect_probe`.
-        // Subtract 1 from `peers.len()` to take the target peer into account.
         let num_peers_for_indirect_probe = std::cmp::min(
-            self.peers.len().saturating_sub(1),
+            self.peers.len(),
             self.config.max_number_peers_for_indirect_probe,
         );
 
-        let peers_for_ping_req =
-            self.random_peers_for_ping_req(target_peer_addr, num_peers_for_indirect_probe);
+        let peers_for_ping_req = self.random_peers_for_ping_req(num_peers_for_indirect_probe);
+        dbg!(&peers_for_ping_req);
 
-        let peers_received_in_acks = dissemination::disseminate_ping(DisseminatePingInput {
-            peer_socket_addr: self.config.socket_addr,
-            target_peer_addr: target_peer_addr,
-            piggybacking_peers,
-            peers_for_ping_req,
-            peer_ping_request_timeout: self.config.peer_ping_request_timeout,
-        })
-        .await;
+        match tokio::time::timeout(
+            self.config.failure_detection_timeout,
+            dissemination::disseminate_ping(DisseminatePingInput {
+                peer_socket_addr: self.config.socket_addr,
+                target_peer_addr: target_peer_addr,
+                piggybacking_peers,
+                peers_for_ping_req,
+                peer_ping_request_timeout_for_indirect_probe: self
+                    .config
+                    .peer_ping_request_timeout_for_indirect_probe,
+                peer_ping_req_request_timeout: self.config.peer_ping_req_request_timeout,
+            }),
+        )
+        .await
+        {
+            Err(err) => {
+                debug!(?err, "ping dissemination timed out");
+            }
+            Ok(peers_received_in_acks) => {
+                // If the peer target peer is unreachable.
+                if peers_received_in_acks.is_empty() {
+                    debug!("peer is unreachable");
+                    self.suspect(target_peer_index).await;
+                    return;
+                }
 
-        // If the peer target peer is unreachable.
-        if peers_received_in_acks.is_empty() {
-            debug!("peer is unreachable");
-            self.suspect(target_peer_index).await;
-            return;
-        }
-
-        for (_, peer) in peers_received_in_acks {
-            self.peer_received(peer).await;
+                for (_, peer) in peers_received_in_acks {
+                    self.peer_received(peer).await;
+                }
+            }
         }
     }
 
@@ -450,26 +482,18 @@ impl Memberlist {
         target_peer.status = PeerStatus::Suspected;
     }
 
-    fn random_peers_for_ping_req(
-        &self,
-        target_peer_addr: SocketAddr,
-        num_peers: usize,
-    ) -> HashSet<SocketAddr> {
+    fn random_peers_for_ping_req(&self, num_peers: usize) -> HashSet<SocketAddr> {
         let mut peers = HashSet::with_capacity(num_peers);
 
-        println!("aaaaaa ENTER random_peers_for_ping_req",);
         let mut current_next_peer_index = self.next_peer_index;
 
+        println!("aaaaaa num_peers {:?}", num_peers);
         for _ in 0..num_peers {
             let peer = &self.peers[current_next_peer_index];
             current_next_peer_index = current_next_peer_index + 1 % self.peers.len();
 
-            if peer.addr != target_peer_addr && !peers.contains(&peer.addr) {
-                peers.insert(peer.addr);
-            }
+            peers.insert(peer.addr);
         }
-
-        println!("aaaaaa DONE random_peers_for_ping_req",);
 
         peers
     }
@@ -536,6 +560,7 @@ impl Memberlist {
             self.is_suspected |= peer.status == PeerStatus::Suspected;
 
             // TODO: handle dead case
+            return;
         }
 
         match self.peers.iter().position(|p| p.addr == peer.addr) {
@@ -547,7 +572,9 @@ impl Memberlist {
                 if let Err(err) = self.sender.send(Notification::Join(peer.addr)).await {
                     error!(?err, "unable to send new peer notification");
                 }
-                self.peers.push(Peer::from((peer, min_dissemination_count)));
+                let peer = Peer::from((peer, min_dissemination_count));
+                debug!(?peer, "adding peer to peer list");
+                self.peers.push(peer);
             }
             // We already know about this peer, the info we have about it may be outdated.
             Some(known_peer_index) => {

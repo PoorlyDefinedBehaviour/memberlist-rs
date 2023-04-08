@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
@@ -13,12 +13,14 @@ use crate::{
 
 pub(crate) const RECV_BUFFER_SIZE_IN_BYTES: usize = 2048;
 
+#[derive(Debug)]
 pub(crate) struct DisseminatePingInput {
     pub peer_socket_addr: SocketAddr,
     pub target_peer_addr: SocketAddr,
     pub piggybacking_peers: Vec<PiggybackingPeer>,
     pub peers_for_ping_req: HashSet<SocketAddr>,
-    pub peer_ping_request_timeout: Duration,
+    pub peer_ping_request_timeout_for_indirect_probe: Duration,
+    pub peer_ping_req_request_timeout: Duration,
 }
 
 pub(crate) async fn disseminate_ping(
@@ -38,6 +40,7 @@ pub(crate) async fn disseminate_ping(
             )
             .await
             {
+                debug!(?ack_message, "received ack for ping message");
                 if let Err(err) = sender.send(ack_message).await {
                     error!(?err, "unable to send ping ack message to channel");
                 }
@@ -46,24 +49,41 @@ pub(crate) async fn disseminate_ping(
     };
 
     let ping_req_handle = tokio::spawn(async move {
-        tokio::time::sleep(input.peer_ping_request_timeout).await;
+        dbg!(input.peer_ping_request_timeout_for_indirect_probe);
+        tokio::time::sleep(input.peer_ping_request_timeout_for_indirect_probe).await;
 
+        dbg!(&input.peers_for_ping_req);
         futures::future::join_all(input.peers_for_ping_req.into_iter().map(|peer_addr| {
             let sender = sender.clone();
             let piggybacking_peers = input.piggybacking_peers.clone();
+            println!("aaaaaa sending pingreq to peer_addr {:?}", peer_addr);
 
             async move {
-                if let Ok(ack_message) = ping_req(
-                    input.peer_socket_addr,
-                    peer_addr,
-                    input.target_peer_addr,
-                    piggybacking_peers,
+                match tokio::time::timeout(
+                    input.peer_ping_req_request_timeout,
+                    ping_req(
+                        input.peer_socket_addr,
+                        peer_addr,
+                        input.target_peer_addr,
+                        piggybacking_peers,
+                    ),
                 )
                 .await
                 {
-                    if let Err(err) = sender.send(ack_message).await {
-                        error!(?err, "unable to send ack message from pingreq to channel");
+                    Err(err) => {
+                        debug!(?err, "pingreq request timed out");
                     }
+                    Ok(result) => match result {
+                        Err(err) => {
+                            debug!(?err, "pingreq request error");
+                        }
+                        Ok(ack_message) => {
+                            debug!(?ack_message, "received ack for ping request");
+                            if let Err(err) = sender.send(ack_message).await {
+                                error!(?err, "unable to send ack message from pingreq to channel");
+                            }
+                        }
+                    },
                 }
             }
         }))
@@ -95,12 +115,17 @@ pub(crate) async fn disseminate_ping(
     return piggybacking_peers;
 }
 
+#[tracing::instrument(name = "dissemination::ping", skip_all, fields(
+    peer_socket_addr = ?peer_socket_addr,
+    target_peer_addr = ?target_peer_addr,
+    piggybacking_peers = ?piggybacking_peers,
+))]
 pub(crate) async fn ping(
     peer_socket_addr: SocketAddr,
     target_peer_addr: SocketAddr,
     piggybacking_peers: Vec<PiggybackingPeer>,
 ) -> Result<AckMessage> {
-    debug!(?peer_socket_addr, ?target_peer_addr, "sending ping mesage");
+    debug!("sending ping mesage");
 
     let ack_message = send_message(
         peer_socket_addr,
@@ -196,26 +221,26 @@ pub(crate) async fn send_message(
 
     let mut buffer = vec![0_u8; RECV_BUFFER_SIZE_IN_BYTES];
 
+    debug!("waiting for message response");
+
     loop {
-        let _bytes_read = socket
+        let bytes_read = socket
             .recv(&mut buffer)
             .await
             .context("trying to message response")?;
 
-        if buffer.is_empty() {
-            debug!("received empty response from peer");
-            return Err(anyhow!(
-                "tried to read message response but got empty buffer"
-            ));
-        }
+        debug!("read {bytes_read} response");
 
         if buffer[0] == PeerMessageType::Ack.as_u8() {
             return Ok(AckMessage::try_from(buffer.as_ref())?);
         }
 
         debug!(
-            peer_message_type = buffer[0],
+            peer_message_type = ?PeerMessageType::from(buffer[0]),
             "received response with unexpected message type"
         );
+
+        // Fill the buffer with zeroes to reuse it.
+        buffer.fill(0);
     }
 }
