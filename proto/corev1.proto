@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package corev1;
+
+service Member {
+    rpc Ping(PingRequest) returns (AckResponse) {}
+    rpc PingReq(PingReqRequest) returns (AckResponse) {}
+}
+
+message PingRequest {
+    repeated Peer piggybacking_peers = 1;
+}
+
+message PingReqRequest {
+    PeerAddr target_peer_addr = 1;
+    repeated Peer piggybacking_peers = 2;
+}
+
+message AckResponse {
+    repeated Peer piggybacking_peers = 1;
+}
+
+message Peer {
+    PeerAddr addr = 1;
+    PeerStatus status = 2;
+    uint32 incarnation_number = 3;
+}
+
+message PeerAddr {
+    uint32 type = 1;
+    string addr = 2;
+}
+
+enum PeerStatus {
+    Alive = 0;
+    Dead = 1;
+    Suspected = 2;
+}

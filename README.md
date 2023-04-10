@@ -1,3 +1,6 @@
+# Example
+
+```rust
 use std::{
     collections::HashSet,
     net::{AddrParseError, SocketAddr},
@@ -5,17 +8,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use memberlist::{Config, Notification};
-use tracing_subscriber::{prelude::*, EnvFilter};
 
-// RUST_LOG=memberlist=debug SOCKET_ADDR=0.0.0.0:9000 JOIN_PEERS=0.0.0.0:9001 cargo run --example main
-// RUST_LOG=memberlist=debug SOCKET_ADDR=0.0.0.0:9001 JOIN_PEERS=0.0.0.0:9000 cargo run --example main
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
-        .with(EnvFilter::from_env("RUST_LOG"))
-        .init();
-
     let socket_addr: SocketAddr = std::env::var("SOCKET_ADDR")
         .context("SOCKET_ADDR env var is required")?
         .parse()?;
@@ -36,7 +31,6 @@ async fn main() -> Result<()> {
     let mut members = HashSet::new();
 
     while let Some(notification) = receiver.recv().await {
-        dbg!(&notification);
         match notification {
             Notification::Join(peer_addr) | Notification::Alive(peer_addr) => {
                 members.insert(peer_addr);
@@ -45,8 +39,13 @@ async fn main() -> Result<()> {
                 members.remove(&peer_addr);
             }
         }
-        dbg!(&members);
     }
 
     Ok(())
 }
+
+```
+
+# References
+
+https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf
